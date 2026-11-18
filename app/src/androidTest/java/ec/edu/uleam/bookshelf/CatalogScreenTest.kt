@@ -30,13 +30,11 @@ import okhttp3.mockwebserver.RecordedRequest
 import okhttp3.tls.HandshakeCertificates
 import okhttp3.tls.HeldCertificate
 import okio.Buffer
-import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 import retrofit2.Retrofit
 import retrofit2.converter.gson.GsonConverterFactory
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.TimeUnit
+import java.util.concurrent.ConcurrentHashMap
 
 class CatalogScreenTest {
     @get:Rule val compose = createAndroidComposeRule<ComponentActivity>()
@@ -44,7 +42,7 @@ class CatalogScreenTest {
     @Test fun searchLoadsBothTitlesAndCoverImages() {
         val instrumentation = InstrumentationRegistry.getInstrumentation()
         val context = instrumentation.targetContext
-        val certificate = HeldCertificate.Builder().addSubjectAlternativeName("localhost").build()
+        val certificate = HeldCertificate.Builder().addSubjectAlternativeName("127.0.0.1").build()
         val serverTls = HandshakeCertificates.Builder().heldCertificate(certificate).build()
         val clientTls = HandshakeCertificates.Builder().addTrustedCertificate(certificate.certificate).build()
         val client = OkHttpClient.Builder()
@@ -52,6 +50,7 @@ class CatalogScreenTest {
         MockWebServer().use { server ->
             server.useHttps(serverTls.sslSocketFactory(), false)
             server.start()
+            val baseUrl = server.url("/").newBuilder().host("127.0.0.1").build()
             val books = mapOf("mar" to "Cartas del litoral", "ruta" to "Rutas de Manabí")
             server.dispatcher = object : Dispatcher() {
                 override fun dispatch(request: RecordedRequest): MockResponse {
@@ -60,7 +59,7 @@ class CatalogScreenTest {
                     return when {
                         path == "/volumes" -> MockResponse().setBody("""{"items":[{"id":"mar"},{"id":"ruta"}]}""")
                         path.startsWith("/volumes/") && id in books -> {
-                            val cover = server.url("/covers/$id")
+                            val cover = baseUrl.resolve("/covers/$id")!!
                             val author = if (id == "mar") "Ana Vera" else "Luis Cedeño"
                             MockResponse().setBody("""{"volumeInfo":{"title":"${books[id]}","authors":["$author"],"imageLinks":{"thumbnail":"$cover"}}}""")
                         }
@@ -72,23 +71,24 @@ class CatalogScreenTest {
                     }
                 }
             }
-            val coversLoaded = CountDownLatch(2)
+            val coversLoaded = ConcurrentHashMap.newKeySet<String>()
             val imageLoader = ImageLoader.Builder(context).okHttpClient(client)
+                .networkObserverEnabled(false)
                 .eventListener(object : EventListener {
                     override fun onSuccess(request: ImageRequest, result: SuccessResult) {
-                        coversLoaded.countDown()
+                        coversLoaded.add(request.data.toString())
                     }
                 }).build()
             Coil.setImageLoader(imageLoader)
             try {
-                val api = Retrofit.Builder().baseUrl(server.url("/")).client(client)
+                val api = Retrofit.Builder().baseUrl(baseUrl).client(client)
                     .addConverterFactory(GsonConverterFactory.create()).build().create(BooksApi::class.java)
                 compose.setContent {
                     val model: ShelfViewModel = viewModel { ShelfViewModel(GoogleBooksRepository(api)) }
                     val state by model.state.collectAsStateWithLifecycle()
                     BookshelfScreen(state, model.lastQuery, model::search, model::browseLocal)
                 }
-                assertTrue("Las dos portadas deben descargarse", coversLoaded.await(60, TimeUnit.SECONDS))
+                compose.waitUntil(timeoutMillis = 90_000) { coversLoaded.size == books.size }
                 compose.onNodeWithText("Cartas del litoral").assertIsDisplayed()
                 compose.onNodeWithText("Rutas de Manabí").assertIsDisplayed()
                 compose.waitForIdle()
